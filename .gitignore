@@ -1,0 +1,14 @@
+# 编译生成的中间文件
+*.o
+*.obj
+*.out
+*.exe
+*.dll
+*.so
+
+# 调试和构建目录
+/build/
+/bin/
+/obj/
+.vscode/
+.vs/
