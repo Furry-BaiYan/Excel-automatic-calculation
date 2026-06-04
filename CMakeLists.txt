@@ -4,7 +4,6 @@ project(ExcelProcessor VERSION 1.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 加这三行
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
@@ -16,6 +15,7 @@ find_package(Qt6 REQUIRED COMPONENTS
     Widgets
     Gui
     PrintSupport
+    Network
 )
 
 add_subdirectory(QXlsx/QXlsx)
@@ -27,8 +27,11 @@ set(SOURCES
     src/io/PdfExporter.cpp
     src/core/FormulaEngine.cpp
     src/core/StatEngine.cpp
-    src/config/ProcessRule.cpp
+    src/config/ExprEvaluator.cpp
+    src/config/FormulaParser.cpp
     src/config/RuleEditor.cpp
+    src/config/AIAssistant.cpp
+    src/config/ApiSettingsDialog.cpp
 )
 
 add_executable(ExcelProcessor ${SOURCES})
@@ -38,5 +41,6 @@ target_link_libraries(ExcelProcessor PRIVATE
     Qt6::Widgets
     Qt6::Gui
     Qt6::PrintSupport
+    Qt6::Network
     QXlsx::QXlsx
 )

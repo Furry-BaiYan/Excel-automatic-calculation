@@ -5,9 +5,9 @@
 
 class PdfExporter {
 public:
-    // 导出完整报告：标题 + 数据表 + 整体统计 + 分组统计
     static bool exportReport(const DataTable&  dataTable,
                              const StatReport& report,
                              const QString&    filePath,
+                             const QString&    title    = "",
                              QString*          errorMsg = nullptr);
 };

@@ -1,420 +1,398 @@
 #include "RuleEditor.h"
-#include <QTabWidget>
-#include <QTableWidget>
-#include <QListWidget>
-#include <QComboBox>
-#include <QLineEdit>
-#include <QPushButton>
+#include "FormulaParser.h"
+#include "AIAssistant.h"
+#include "ApiSettingsDialog.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
-#include <QFormLayout>
-#include <QHeaderView>
+#include <QTextEdit>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QComboBox>
 #include <QLabel>
+#include <QPushButton>
 #include <QGroupBox>
+#include <QFormLayout>
+#include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QMessageBox>
-#include <QCheckBox>
-#include <QDialogButtonBox>
-#include <QDoubleSpinBox>
-#include <QDebug>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QFile>
+#include <QFont>
 
 RuleEditor::RuleEditor(const QStringList& columns, QWidget* parent)
     : QDialog(parent), m_cols(columns) {
     setWindowTitle("规则配置器");
-    setMinimumSize(780, 580);
-    buildUI();
-    refreshColCombos();
-}
+    setMinimumSize(720, 640);
 
-void RuleEditor::buildUI() {
-    auto* mainLayout = new QVBoxLayout(this);
+    m_ai = new AIAssistant(this);
+    connect(m_ai, &AIAssistant::suggestionsReady, this, &RuleEditor::onAISuggestions);
+    connect(m_ai, &AIAssistant::errorOccurred,    this, &RuleEditor::onAIError);
+    connect(m_ai, &AIAssistant::analyzing,         this, &RuleEditor::onAIAnalyzing);
 
-    // 顶部说明
-    auto* tip = new QLabel("程序会自动探测列名，配置好规则后点确定运行。", this);
-    tip->setStyleSheet("color:#555; padding:4px;");
-    mainLayout->addWidget(tip);
+    auto* lay = new QVBoxLayout(this);
 
-    auto* tabs = new QTabWidget(this);
+    // ── 顶部：列名 + AI 按钮 ──────────────────────
+    auto* topRow = new QHBoxLayout;
+    auto* colLabel = new QLabel(
+        "📋 列名：<b>" + m_cols.join("　") + "</b>", this);
+    colLabel->setWordWrap(true);
+    colLabel->setStyleSheet(
+        "background:#1e3a5f;color:#aad4ff;padding:8px;border-radius:4px;");
+    topRow->addWidget(colLabel, 1);
 
-    auto* tab1 = new QWidget; buildFormulaTab(tab1);
-    auto* tab2 = new QWidget; buildClassifyTab(tab2);
-    auto* tab3 = new QWidget; buildStatTab(tab3);
+    m_btnAI = new QPushButton("🤖 AI 分析推荐", this);
+    m_btnAI->setStyleSheet(
+        "background:#6b2fb3;color:white;font-weight:bold;"
+        "padding:8px 16px;border-radius:4px;min-width:120px;");
+    auto* btnKey = new QPushButton("⚙️", this);
+    btnKey->setFixedWidth(32);
+    btnKey->setToolTip("设置 API");
 
-    tabs->addTab(tab1, "➕ 算术公式");
-    tabs->addTab(tab2, "🏷 条件分级");
-    tabs->addTab(tab3, "📊 统计配置");
-    mainLayout->addWidget(tabs);
+    connect(m_btnAI, &QPushButton::clicked, this, &RuleEditor::onAIAnalyze);
+    connect(btnKey,  &QPushButton::clicked, this, &RuleEditor::onSetApiKey);
+    topRow->addWidget(m_btnAI);
+    topRow->addWidget(btnKey);
+    lay->addLayout(topRow);
 
-    // 底部：保存/加载 + 确定/取消
-    auto* btnRow = new QHBoxLayout;
-    auto* btnSave = new QPushButton("💾 保存规则", this);
-    auto* btnLoad = new QPushButton("📂 加载规则", this);
-    connect(btnSave, &QPushButton::clicked, this, &RuleEditor::onSaveRule);
-    connect(btnLoad, &QPushButton::clicked, this, &RuleEditor::onLoadRule);
-    btnRow->addWidget(btnSave);
-    btnRow->addWidget(btnLoad);
-    btnRow->addStretch();
+    // ── 报告标题 ──────────────────────────────────
+    auto* titleRow = new QHBoxLayout;
+    titleRow->addWidget(new QLabel("报告标题：", this));
+    m_titleEdit = new QLineEdit(this);
+    m_titleEdit->setPlaceholderText("AI 自动生成，也可手动修改");
+    titleRow->addWidget(m_titleEdit, 1);
+    lay->addLayout(titleRow);
+
+    // ── 格式要求 ──────────────────────────────────
+    auto* fmtGrp = new QGroupBox("格式要求（可选，留空则 AI 自动判断）", this);
+    auto* fmtLay = new QVBoxLayout(fmtGrp);
+    m_formatReq = new QTextEdit(fmtGrp);
+    m_formatReq->setMaximumHeight(60);
+    m_formatReq->setFont(QFont("Microsoft YaHei", 11));
+    m_formatReq->setPlaceholderText(
+        "示例：等级分为 优秀/良好/及格/不及格，金额保留2位小数，工资超过10000为高薪");
+    fmtLay->addWidget(m_formatReq);
+    lay->addWidget(fmtGrp);
+
+    // ── 语法提示 ──────────────────────────────────
+    auto* tip = new QLabel(
+        "✏️ 每行一条，格式：<b>新列名 = 表达式</b>　　"
+        "支持：<code>+ - * / ( )  IF  IFS  SUM  AVERAGE  ROUND  MAX  MIN ...</code>",
+        this);
+    tip->setWordWrap(true);
+    tip->setStyleSheet("color:#888;font-size:11px;padding:2px;");
+    lay->addWidget(tip);
+
+    // ── 公式编辑器 ────────────────────────────────
+    m_editor = new QTextEdit(this);
+    m_editor->setFont(QFont("Consolas", 13));
+    m_editor->setMinimumHeight(200);
+    m_editor->setPlaceholderText(
+        "# 点击【🤖 AI 分析推荐】自动生成公式\n"
+        "# 或手动输入，示例：\n\n"
+        "总分 = 数学 + 语文 + 英语\n"
+        "平均分 = ROUND(总分 / 3, 1)\n"
+        "等级 = IFS(总分>=270, \"优秀\", 总分>=225, \"良好\", \"待改进\")");
+    lay->addWidget(m_editor);
+
+    // ── 状态栏 ────────────────────────────────────
+    m_status = new QLabel("", this);
+    m_status->setWordWrap(true);
+    m_status->setMinimumHeight(24);
+    lay->addWidget(m_status);
+
+    // ── 统计配置 ──────────────────────────────────
+    auto* statGrp = new QGroupBox("统计配置（可选，AI 自动选择）", this);
+    auto* sg = new QHBoxLayout(statGrp);
+
+    auto* leftLay = new QVBoxLayout;
+    leftLay->addWidget(new QLabel("统计列（勾选要汇总的列）："));
+    m_statList = new QListWidget;
+    m_statList->setMaximumHeight(90);
+    for (const auto& c : m_cols) {
+        auto* item = new QListWidgetItem(c, m_statList);
+        item->setCheckState(Qt::Unchecked);
+    }
+    leftLay->addWidget(m_statList);
+
+    auto* rightLay = new QFormLayout;
+    m_groupBox = new QComboBox;
+    m_groupBox->addItem("（不分组）", "");
+    for (const auto& c : m_cols) m_groupBox->addItem(c, c);
+    rightLay->addRow("分组列：", m_groupBox);
+
+    sg->addLayout(leftLay, 2);
+    sg->addLayout(rightLay, 1);
+    lay->addWidget(statGrp);
+
+    // ── 底部按钮 ──────────────────────────────────
+    auto* bRow = new QHBoxLayout;
+    auto* bVal  = new QPushButton("✅ 验证公式", this);
+    auto* bSave = new QPushButton("💾 保存规则", this);
+    auto* bLoad = new QPushButton("📂 加载规则", this);
+    bVal->setStyleSheet("background:#217346;color:white;font-weight:bold;");
+
+    connect(bVal,  &QPushButton::clicked, this, &RuleEditor::onValidate);
+    connect(bSave, &QPushButton::clicked, this, &RuleEditor::onSave);
+    connect(bLoad, &QPushButton::clicked, this, &RuleEditor::onLoad);
 
     auto* box = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    connect(box, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(box, &QDialogButtonBox::accepted, this, [this]() {
+        onValidate();
+        if (!m_status->text().startsWith("❌")) accept();
+    });
     connect(box, &QDialogButtonBox::rejected, this, &QDialog::reject);
-    btnRow->addWidget(box);
-    mainLayout->addLayout(btnRow);
+
+    bRow->addWidget(bVal);
+    m_btnFix = new QPushButton("🔧 AI 修复", this);
+    m_btnFix->setStyleSheet("background:#8b4513;color:white;font-weight:bold;");
+    m_btnFix->setVisible(false); // 默认隐藏
+    connect(m_btnFix, &QPushButton::clicked, this, &RuleEditor::onAIFix);
+    bRow->addWidget(m_btnFix);
+    bRow->addWidget(bSave);
+    bRow->addWidget(bLoad);
+    bRow->addStretch();
+    bRow->addWidget(box);
+    lay->addLayout(bRow);
 }
 
-// ── Tab1：算术公式 ─────────────────────────────
-void RuleEditor::buildFormulaTab(QWidget* tab) {
-    auto* lay = new QVBoxLayout(tab);
-
-    m_arithTable = new QTableWidget(0, 4, tab);
-    m_arithTable->setHorizontalHeaderLabels({"新列名", "运算", "列 A", "列 B"});
-    m_arithTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-    m_arithTable->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_arithTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    lay->addWidget(m_arithTable);
-
-    auto* btnRow = new QHBoxLayout;
-    auto* btnAdd = new QPushButton("➕ 添加公式", tab);
-    auto* btnDel = new QPushButton("🗑 删除选中", tab);
-    connect(btnAdd, &QPushButton::clicked, this, &RuleEditor::onAddArith);
-    connect(btnDel, &QPushButton::clicked, this, &RuleEditor::onRemoveFormula);
-    btnRow->addWidget(btnAdd);
-    btnRow->addWidget(btnDel);
-    btnRow->addStretch();
-
-    // 内联输入区
-    auto* grp = new QGroupBox("添加一条算术公式", tab);
-    auto* fl  = new QFormLayout(grp);
-
-    auto* nameEdit = new QLineEdit(grp); nameEdit->setObjectName("arithName");
-    auto* opBox    = new QComboBox(grp);  opBox->setObjectName("arithOp");
-    auto* colABox  = new QComboBox(grp);  colABox->setObjectName("arithColA");
-    auto* colBBox  = new QComboBox(grp);  colBBox->setObjectName("arithColB");
-    colBBox->setEditable(true);                                              
-    colBBox->lineEdit()->setPlaceholderText("选列名或直接输数字，如：3");    
-
-    opBox->addItems({"除法 (A÷B)", "减法 (A−B)", "加法 (A+B)", "乘法 (A×B)"});
-    
-
-    opBox->addItems({"除法 (A÷B)", "减法 (A−B)", "加法 (A+B)", "乘法 (A×B)"});
-
-    fl->addRow("新列名：",  nameEdit);
-    fl->addRow("运算类型：", opBox);
-    fl->addRow("列 A：",    colABox);
-    fl->addRow("列 B：",    colBBox);
-
-    btnRow->addWidget(grp);
-    lay->addLayout(btnRow);
+void RuleEditor::setSampleData(const QVector<QStringList>& rows) {
+    m_sampleRows = rows;
 }
 
-// ── Tab2：条件分级 ─────────────────────────────
-void RuleEditor::buildClassifyTab(QWidget* tab) {
-    auto* lay = new QVBoxLayout(tab);
-
-    auto* topRow = new QHBoxLayout;
-    auto* grp    = new QGroupBox("分级设置", tab);
-    auto* fl     = new QFormLayout(grp);
-
-    m_clsNewName = new QLineEdit(grp);
-    m_clsSrcCol  = new QComboBox(grp);
-    fl->addRow("新列名：",  m_clsNewName);
-    fl->addRow("来源列：",  m_clsSrcCol);
-    topRow->addWidget(grp);
-    topRow->addStretch();
-    lay->addLayout(topRow);
-
-    // 条件表：阈值 | 运算符 | 标签
-    auto* condLabel = new QLabel("条件列表（从上往下匹配，第一个满足的生效）：", tab);
-    lay->addWidget(condLabel);
-
-    m_clsTable = new QTableWidget(0, 3, tab);
-    m_clsTable->setHorizontalHeaderLabels({"阈值（数字）", "运算符", "标签（文本）"});
-    m_clsTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-    lay->addWidget(m_clsTable);
-
-    auto* btnRow = new QHBoxLayout;
-    auto* btnAdd = new QPushButton("➕ 添加条件", tab);
-    auto* btnDel = new QPushButton("🗑 删除条件", tab);
-    auto* btnConfirm = new QPushButton("✅ 确认添加分级规则", tab);
-    btnConfirm->setStyleSheet("background:#4472C4; color:white; font-weight:bold;");
-
-    connect(btnAdd, &QPushButton::clicked, this, &RuleEditor::onAddCondition);
-    connect(btnDel, &QPushButton::clicked, this, &RuleEditor::onRemoveCondition);
-    connect(btnConfirm, &QPushButton::clicked, this, &RuleEditor::onAddClassify);
-
-    btnRow->addWidget(btnAdd);
-    btnRow->addWidget(btnDel);
-    btnRow->addStretch();
-    btnRow->addWidget(btnConfirm);
-    lay->addLayout(btnRow);
-
-    // 提示
-    auto* eg = new QLabel(
-        "示例：来源列=销售额，条件：≥8000→优秀  ≥5000→良好  ≥0→待改进", tab);
-    eg->setStyleSheet("color:#888; font-size:11px;");
-    lay->addWidget(eg);
-}
-
-// ── Tab3：统计配置 ─────────────────────────────
-void RuleEditor::buildStatTab(QWidget* tab) {
-    auto* lay = new QVBoxLayout(tab);
-
-    lay->addWidget(new QLabel("选择要统计的数值列（合计/均值/最大/最小）：", tab));
-    m_statColList = new QListWidget(tab);
-    for (const auto& col : m_cols) {
-        auto* item = new QListWidgetItem(col, m_statColList);
-        item->setCheckState(Qt::Unchecked);
+// ── AI 分析 ────────────────────────────────────
+void RuleEditor::onAIAnalyze() {
+    if (m_ai->config().apiKey.trimmed().isEmpty()) {
+        onSetApiKey();
+        if (m_ai->config().apiKey.trimmed().isEmpty()) return;
     }
-    lay->addWidget(m_statColList);
-
-    auto* fl = new QFormLayout;
-    m_groupColBox = new QComboBox(tab);
-    m_groupColBox->addItem("（不分组）", "");
-    for (const auto& col : m_cols)
-        m_groupColBox->addItem(col, col);
-    fl->addRow("分组列：", m_groupColBox);
-    lay->addLayout(fl);
+    m_ai->analyze(m_cols, m_sampleRows,
+                  m_formatReq ? m_formatReq->toPlainText().trimmed() : "");
 }
 
-// ── 刷新所有列名下拉框 ─────────────────────────
-void RuleEditor::refreshColCombos() {
-    auto fillCombo = [&](const QString& objName) {
-        auto* cb = findChild<QComboBox*>(objName);
-        if (!cb) return;
-        cb->clear();
-        for (const auto& c : m_cols) cb->addItem(c);
-    };
-    fillCombo("arithColA");
-    fillCombo("arithColB");
-    if (m_clsSrcCol) {
-        m_clsSrcCol->clear();
-        for (const auto& c : m_cols) m_clsSrcCol->addItem(c);
-    }
+void RuleEditor::onAIAnalyzing() {
+    m_btnAI->setEnabled(false);
+    m_btnAI->setText("⏳ AI 分析中...");
+    m_status->setText("🤖 正在分析数据，请稍候...");
+    m_status->setStyleSheet("color:#6b2fb3;font-weight:bold;");
 }
 
-// ── 添加一条算术公式到表格 ─────────────────────
-void RuleEditor::onAddArith() {
-    auto* nameEdit = findChild<QLineEdit*>("arithName");
-    auto* opBox    = findChild<QComboBox*>("arithOp");
-    auto* colABox  = findChild<QComboBox*>("arithColA");
-    auto* colBBox  = findChild<QComboBox*>("arithColB");
+void RuleEditor::onAISuggestions(const QString& text) {
+    m_btnAI->setEnabled(true);
+    m_btnAI->setText("🤖 AI 分析推荐");
 
-    if (!nameEdit || nameEdit->text().trimmed().isEmpty()) {
-        QMessageBox::warning(this, "提示", "请填写新列名");
-        return;
+    // ── 解析公式、统计配置、报告标题 ─────────────
+    QStringList formulaLines;
+    QStringList statCols;
+    QString     groupCol;
+    QString     aiTitle;
+    bool inStatSection  = false;
+    bool inTitleSection = false;
+
+    for (const auto& line : text.split('\n')) {
+        QString t = line.trimmed();
+
+        // 检测段落
+        if (t.startsWith("## 报告标题") || t == "# 报告标题") {
+            inTitleSection = true; inStatSection = false; continue;
+        }
+        if (t.startsWith("## 统计配置") || t == "# 统计配置" ||
+            t.contains("统计配置")) {
+            inStatSection = true; inTitleSection = false; continue;
+        }
+        // 新段落重置
+        if (t.startsWith("##") || t.startsWith("# ")) {
+            inStatSection = false; inTitleSection = false;
+        }
+
+        if (inTitleSection) {
+            if (!t.isEmpty() && !t.startsWith("#") && !t.startsWith("##")) {
+                aiTitle = t; inTitleSection = false;
+            }
+            continue;
+        }
+
+        if (inStatSection) {
+            // 统计列
+            if (t.startsWith("统计列")) {
+                int colon = t.indexOf(QChar(':'));
+                if (colon < 0) colon = t.indexOf(QString("："));
+                if (colon >= 0) {
+                    for (const auto& c : t.mid(colon+1).split(','))
+                        if (!c.trimmed().isEmpty() && c.trimmed() != "无")
+                            statCols << c.trimmed();
+                }
+            }
+            // 分组列
+            else if (t.startsWith("分组列")) {
+                int colon = t.indexOf(QChar(':'));
+                if (colon < 0) colon = t.indexOf(QString("："));
+                if (colon >= 0) {
+                    groupCol = t.mid(colon+1).trimmed();
+                    if (groupCol == "无" || groupCol.toLower() == "none")
+                        groupCol = "";
+                }
+            }
+            continue;
+        }
+
+        formulaLines << line;
     }
 
-    QString newName = nameEdit->text().trimmed(); // ← 先保存，再 clear
+    // ── 填入报告标题 ──────────────────────────────
+    if (!aiTitle.isEmpty() && m_titleEdit->text().trimmed().isEmpty())
+        m_titleEdit->setText(aiTitle);
 
-    int row = m_arithTable->rowCount();
-    m_arithTable->insertRow(row);
-    m_arithTable->setItem(row, 0, new QTableWidgetItem(newName));
-    m_arithTable->setItem(row, 1, new QTableWidgetItem(opBox->currentText()));
-    m_arithTable->setItem(row, 2, new QTableWidgetItem(colABox->currentText()));
-    m_arithTable->setItem(row, 3, new QTableWidgetItem(colBBox->currentText()));
+    // ── 填入公式编辑器 ────────────────────────────
+    QString formulas = formulaLines.join('\n').trimmed();
+    QString current  = m_editor->toPlainText().trimmed();
+    if (current.isEmpty())
+        m_editor->setPlainText(formulas);
+    else
+        m_editor->setPlainText(current + "\n\n# ── AI 新建议 ──\n" + formulas);
 
-    nameEdit->clear();
+    // ── 自动配置统计 ──────────────────────────────
+    onValidate(); // 先把新公式列加入列表
+    if (m_btnFix) m_btnFix->setVisible(false); // ← 加这行：AI推荐成功，隐藏修复按钮
+    if (!statCols.isEmpty() || !groupCol.isEmpty())
+        setStatConfig(groupCol, statCols);
 
-    // ── 把新列名同步到所有下拉框 ──────────────────
-    if (colABox->findText(newName) == -1) colABox->addItem(newName);
-    if (colBBox->findText(newName) == -1) colBBox->addItem(newName);
-    if (m_clsSrcCol && m_clsSrcCol->findText(newName) == -1)
-        m_clsSrcCol->addItem(newName);
+    QString titleInfo = aiTitle.isEmpty() ? "" : QString("  标题：%1").arg(aiTitle);
+    m_status->setText(
+        QString("✅ AI 完成：统计列 %1 个，分组：%2%3")
+        .arg(statCols.size())
+        .arg(groupCol.isEmpty() ? "无" : groupCol)
+        .arg(titleInfo));
+    m_status->setStyleSheet("color:#00cc66;font-weight:bold;");
+}
 
-    // 统计列列表也加入
-    bool exists = false;
-    for (int i = 0; i < m_statColList->count(); ++i)
-        if (m_statColList->item(i)->text() == newName) { exists = true; break; }
-    if (!exists) {
-        auto* item = new QListWidgetItem(newName, m_statColList);
-        item->setCheckState(Qt::Unchecked);
+void RuleEditor::onAIError(const QString& msg) {
+    m_btnAI->setEnabled(true);
+    m_btnAI->setText("🤖 AI 分析推荐");
+    m_status->setText("❌ " + msg);
+    m_status->setStyleSheet("color:#ff4444;");
+}
+
+void RuleEditor::onSetApiKey() {
+    ApiSettingsDialog dlg(m_ai->config(), this);
+    if (dlg.exec() == QDialog::Accepted)
+        m_ai->setConfig(dlg.result());
+}
+
+// ── 验证公式 ───────────────────────────────────
+void RuleEditor::onValidate() {
+    auto r = FormulaParser::parse(m_editor->toPlainText(), m_cols);
+
+    QStringList existing;
+    for (int i=0;i<m_statList->count();++i)
+        existing << m_statList->item(i)->text();
+
+    for (const auto& f : r.formulas) {
+        if (!existing.contains(f.name)) {
+            auto* item = new QListWidgetItem(f.name, m_statList);
+            item->setCheckState(Qt::Unchecked);
+            existing << f.name;
+        }
+        if (m_groupBox->findData(f.name)==-1)
+            m_groupBox->addItem(f.name, f.name);
+    }
+
+    if (r.ok()) {
+        m_status->setText(QString("✅ %1 条公式解析成功").arg(r.formulas.size()));
+        m_status->setStyleSheet("color:#00cc66;font-weight:bold;");
+    } else {
+        m_status->setText("❌ " + r.errors.join("\n"));
+        m_status->setStyleSheet("color:#ff4444;");
     }
 }
 
-// ── 添加分级规则 ───────────────────────────────
-void RuleEditor::onAddClassify() {
-    if (m_clsNewName->text().trimmed().isEmpty()) {
-        QMessageBox::warning(this, "提示", "请填写新列名");
-        return;
-    }
-    if (m_clsTable->rowCount() == 0) {
-        QMessageBox::warning(this, "提示", "请至少添加一条条件");
-        return;
-    }
-    // 将分级规则也加入 arithTable 作展示（type=classify，colA=来源列）
-    int row = m_arithTable->rowCount();
-    m_arithTable->insertRow(row);
-    m_arithTable->setItem(row, 0, new QTableWidgetItem(m_clsNewName->text().trimmed()));
-    m_arithTable->setItem(row, 1, new QTableWidgetItem("条件分级"));
-    m_arithTable->setItem(row, 2, new QTableWidgetItem(m_clsSrcCol->currentText()));
-    // 把条件序列化为摘要文本放在列B
-    QStringList summary;
-    for (int r = 0; r < m_clsTable->rowCount(); ++r) {
-    auto* spin  = qobject_cast<QDoubleSpinBox*>(m_clsTable->cellWidget(r, 0));
-    auto* opBox = qobject_cast<QComboBox*>(m_clsTable->cellWidget(r, 1));
-    auto* label = m_clsTable->item(r, 2);
-    if (spin && opBox && label && !label->text().trimmed().isEmpty())
-        summary << QString("%1%2→%3")
-                   .arg(opBox->currentText())
-                   .arg(spin->value(), 0, 'f', 1)
-                   .arg(label->text().trimmed());
-}
-    m_arithTable->setItem(row, 3, new QTableWidgetItem(summary.join("; ")));
-    m_clsNewName->clear();
-    m_clsTable->setRowCount(0);
-}
-
-// ── 删除选中公式 ───────────────────────────────
-void RuleEditor::onRemoveFormula() {
-    auto rows = m_arithTable->selectedItems();
-    if (rows.isEmpty()) return;
-    int row = m_arithTable->currentRow();
-    m_arithTable->removeRow(row);
-}
-
-// ── 添加/删除条件行 ────────────────────────────
-void RuleEditor::onAddCondition() {
-    int row = m_clsTable->rowCount();
-    m_clsTable->insertRow(row);
-
-    auto* spinBox = new QDoubleSpinBox;
-    spinBox->setRange(-1e9, 1e9);
-    spinBox->setDecimals(1);
-    m_clsTable->setCellWidget(row, 0, spinBox);
-
-    auto* opBox = new QComboBox;
-    opBox->addItems({">=", ">", "<=", "<", "=="});
-    m_clsTable->setCellWidget(row, 1, opBox);
-
-    m_clsTable->setItem(row, 2, new QTableWidgetItem(""));
-}
-
-void RuleEditor::onRemoveCondition() {
-    int row = m_clsTable->currentRow();
-    if (row >= 0) m_clsTable->removeRow(row);
-}
-
-// ── 保存规则到 JSON ────────────────────────────
-void RuleEditor::onSaveRule() {
+// ── 保存/加载规则 ──────────────────────────────
+void RuleEditor::onSave() {
     QString path = QFileDialog::getSaveFileName(
         this, "保存规则", "", "规则文件 (*.json)");
     if (path.isEmpty()) return;
-    ProcessRule rule = getRule();
-    QString err;
-    if (rule.saveToFile(path, &err))
-        QMessageBox::information(this, "保存成功", "规则已保存：\n" + path);
-    else
-        QMessageBox::warning(this, "保存失败", err);
+    QJsonObject obj;
+    obj["formulas"]    = m_editor->toPlainText();
+    obj["reportTitle"] = m_titleEdit->text();
+    obj["formatReq"]   = m_formatReq ? m_formatReq->toPlainText() : "";
+    auto [gc, sc] = getStatConfig();
+    QJsonArray cols; for (const auto& c : sc) cols.append(c);
+    obj["statCols"] = cols; obj["groupCol"] = gc;
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly)) {
+        f.write(QJsonDocument(obj).toJson());
+        QMessageBox::information(this, "✅ 保存成功", path);
+    }
 }
 
-// ── 从 JSON 加载规则 ───────────────────────────
-void RuleEditor::onLoadRule() {
+void RuleEditor::onLoad() {
     QString path = QFileDialog::getOpenFileName(
         this, "加载规则", "", "规则文件 (*.json)");
     if (path.isEmpty()) return;
-    QString err;
-    ProcessRule rule = ProcessRule::loadFromFile(path, &err);
-    if (!err.isEmpty()) { QMessageBox::warning(this, "加载失败", err); return; }
-    setRule(rule);
-    QMessageBox::information(this, "加载成功",
-        QString("已加载 %1 条公式规则").arg(rule.formulas.size()));
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return;
+    auto obj = QJsonDocument::fromJson(f.readAll()).object();
+    m_editor->setPlainText(obj["formulas"].toString());
+    m_titleEdit->setText(obj["reportTitle"].toString());
+    if (m_formatReq) m_formatReq->setPlainText(obj["formatReq"].toString());
+    QStringList sc;
+    for (const auto& v : obj["statCols"].toArray()) sc << v.toString();
+    setStatConfig(obj["groupCol"].toString(), sc);
+    QMessageBox::information(this, "✅ 加载成功", "规则已加载");
 }
 
-// ── 预加载规则 ─────────────────────────────────
-void RuleEditor::setRule(const ProcessRule& rule) {
-    m_arithTable->setRowCount(0);
+// ── Getter / Setter ────────────────────────────
+void RuleEditor::setFormulaText(const QString& t) { m_editor->setPlainText(t); }
+QString RuleEditor::getFormulaText() const { return m_editor->toPlainText(); }
 
-    for (const auto& f : rule.formulas) {
-        int row = m_arithTable->rowCount();
-        m_arithTable->insertRow(row);
-        m_arithTable->setItem(row, 0, new QTableWidgetItem(f.name));
-
-        QString typeStr;
-        if      (f.type == "divide")   typeStr = "除法 (A÷B)";
-        else if (f.type == "subtract") typeStr = "减法 (A−B)";
-        else if (f.type == "add")      typeStr = "加法 (A+B)";
-        else if (f.type == "multiply") typeStr = "乘法 (A×B)";
-        else if (f.type == "classify") typeStr = "条件分级";
-        m_arithTable->setItem(row, 1, new QTableWidgetItem(typeStr));
-        m_arithTable->setItem(row, 2, new QTableWidgetItem(f.colA));
-
-        if (f.type == "classify") {
-            QStringList s;
-            for (const auto& c : f.conditions)
-                s << QString("%1%2→%3").arg(c.op).arg(c.threshold).arg(c.result.toString());
-            m_arithTable->setItem(row, 3, new QTableWidgetItem(s.join("; ")));
-        } else {
-            m_arithTable->setItem(row, 3, new QTableWidgetItem(f.colB));
-        }
-    }
-
-    // 统计配置
-    for (int i = 0; i < m_statColList->count(); ++i) {
-        auto* item = m_statColList->item(i);
-        item->setCheckState(
-            rule.stat.statCols.contains(item->text())
-            ? Qt::Checked : Qt::Unchecked);
-    }
-    int gi = m_groupColBox->findData(rule.stat.groupCol);
-    if (gi >= 0) m_groupColBox->setCurrentIndex(gi);
+QString RuleEditor::getReportTitle() const {
+    return m_titleEdit ? m_titleEdit->text().trimmed() : "";
+}
+void RuleEditor::setReportTitle(const QString& t) {
+    if (m_titleEdit) m_titleEdit->setText(t);
 }
 
-// ── 读取规则 ───────────────────────────────────
-ProcessRule RuleEditor::getRule() const {
-    ProcessRule rule;
-
-    static const QMap<QString,QString> typeMap = {
-        {"除法 (A÷B)", "divide"},
-        {"减法 (A−B)", "subtract"},
-        {"加法 (A+B)", "add"},
-        {"乘法 (A×B)", "multiply"},
-        {"条件分级",   "classify"}
-    };
-
-    for (int r = 0; r < m_arithTable->rowCount(); ++r) {
-        FormulaRule f;
-        f.name = m_arithTable->item(r,0) ? m_arithTable->item(r,0)->text() : "";
-        QString typeStr = m_arithTable->item(r,1) ? m_arithTable->item(r,1)->text() : "";
-        f.type = typeMap.value(typeStr, "add");
-        f.colA = m_arithTable->item(r,2) ? m_arithTable->item(r,2)->text() : "";
-
-        if (f.type == "classify") {
-            // 解析摘要文本：">=8000→优秀; >=5000→良好"
-            QString summary = m_arithTable->item(r,3)
-                              ? m_arithTable->item(r,3)->text() : "";
-            for (const auto& part : summary.split("; ", Qt::SkipEmptyParts)) {
-                ConditionRule cr;
-                // 找运算符
-                for (const auto& op : {">=","<=",">","<","=="}) {
-                    if (part.startsWith(op)) {
-                        cr.op = op;
-                        QString rest = part.mid(strlen(op));
-                        int arrow = rest.indexOf("→");
-                        if (arrow >= 0) {
-                            cr.threshold = rest.left(arrow).toDouble();
-                            cr.result    = rest.mid(arrow + 1);
-                        }
-                        break;
-                    }
-                }
-                if (!cr.op.isEmpty()) f.conditions << cr;
-            }
-        } else {
-            f.colB = m_arithTable->item(r,3) ? m_arithTable->item(r,3)->text() : "";
-        }
-        if (!f.name.isEmpty()) rule.formulas << f;
+void RuleEditor::setStatConfig(const QString& gc, const QStringList& sc) {
+    for (int i=0;i<m_statList->count();++i) {
+        auto* item=m_statList->item(i);
+        item->setCheckState(sc.contains(item->text())?Qt::Checked:Qt::Unchecked);
     }
-
-    // 统计配置
-    for (int i = 0; i < m_statColList->count(); ++i) {
-        auto* item = m_statColList->item(i);
-        if (item->checkState() == Qt::Checked)
-            rule.stat.statCols << item->text();
-    }
-    rule.stat.groupCol = m_groupColBox->currentData().toString();
-
-    return rule;
+    int gi=m_groupBox->findData(gc);
+    if (gi>=0) m_groupBox->setCurrentIndex(gi);
 }
 
-void RuleEditor::onFormulaTypeChanged(int) {}
+void RuleEditor::onAIFix() {
+    if (m_ai->config().apiKey.trimmed().isEmpty()) {
+        onSetApiKey();
+        if (m_ai->config().apiKey.trimmed().isEmpty()) return;
+    }
+
+    // 收集当前错误
+    auto r = FormulaParser::parse(m_editor->toPlainText(), m_cols);
+    if (r.ok()) { m_btnFix->setVisible(false); return; }
+
+    // 连接修复结果到编辑器（用 lambda 只响应一次）
+    QMetaObject::Connection* conn = new QMetaObject::Connection;
+    *conn = connect(m_ai, &AIAssistant::suggestionsReady,
+                    this, [this, conn](const QString& fixed) {
+        disconnect(*conn); delete conn;
+        m_editor->setPlainText(fixed);
+        m_status->setText("🔧 AI 已修复，请验证");
+        m_status->setStyleSheet("color:#ffaa00;font-weight:bold;");
+        m_btnFix->setVisible(false);
+        onValidate();
+    });
+
+    m_ai->fixFormulas(m_editor->toPlainText(), r.errors, m_cols);
+}
+
+QPair<QString,QStringList> RuleEditor::getStatConfig() const {
+    QStringList sc;
+    for (int i=0;i<m_statList->count();++i) {
+        auto* item=m_statList->item(i);
+        if (item->checkState()==Qt::Checked) sc<<item->text();
+    }
+    return {m_groupBox->currentData().toString(), sc};
+}
